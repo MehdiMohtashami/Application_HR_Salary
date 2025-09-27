@@ -1,0 +1,17 @@
+/HR/templates/
+/Salary/templates/
+.env
+dump-HR-202509220419.sql
+dump-Salary-202509220420.sql
+requirements
+test_auth.py
+test_full_system.py
+test_hr_api.py
+/HR/create_admin.py
+/Salary/create_admin.py
+/Salary/create_all_salary_records.py
+/Salary/create_salary_admin.py
+/Salary/create_salary_records.py
+/Salary/create_salary_requests.py
+/Salary/create_salary_tables.py
+/Salary/create_satary_login.py
