@@ -219,6 +219,30 @@ async def get_employees_with_salary(username: str = Depends(verify_token)):
         })
     return result
 
+@app.delete("/salary-requests/cleanup")
+async def cleanup_salary_requests(employeecode: str, username: str = Depends(verify_token)):
+    try:
+        with data_layer.get_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("DELETE FROM salary_requests WHERE employeecode = %s", (employeecode,))
+                conn.commit()
+        return {"message": "Cleaned up"}
+    except Exception as e:
+        logger.error(f"Cleanup error: {str(e)}")
+        raise HTTPException(500, "Cleanup failed")
+
+@app.delete("/salaries/{employee_code}")
+async def delete_salary(employee_code: str, username: str = Depends(verify_token)):
+    try:
+        with data_layer.get_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("DELETE FROM salary WHERE employeecode = %s", (employee_code,))
+                conn.commit()
+        return {"message": "Deleted"}
+    except Exception as e:
+        logger.error(f"Delete salary error: {str(e)}")
+        raise HTTPException(500, "Delete failed")
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8001)

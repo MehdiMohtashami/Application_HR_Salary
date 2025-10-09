@@ -1,5 +1,7 @@
 import os
 import psycopg2
+import requests
+from fastapi import logger
 from psycopg2 import sql
 from dotenv import load_dotenv
 import bcrypt
@@ -159,8 +161,12 @@ class HRDataLayer:
                         raise ValueError("employee not found")
                     if result[0] == 'Admin':
                         raise ValueError("Cannot delete admin")
+
                     query = sql.SQL("DELETE FROM employee_hr WHERE employeecode = %s")
                     cursor.execute(query, (employee_code,))
+
+                    self.delete_employee_from_salary(employee_code)
+
                     conn.commit()
                     self.log_action(employee_code, "Delete", "Success")
                     return True
@@ -168,3 +174,56 @@ class HRDataLayer:
                     conn.rollback()
                     self.log_action(employee_code, "Delete", "Failed", str(e))
                     raise
+
+    def delete_employee_from_salary(self, employee_code):
+        try:
+            salary_token = self.get_salary_token()
+            if not salary_token:
+                print(f"[ERROR] Cannot get salary token for cleanup of {employee_code}")
+                return False
+
+            headers = {"Authorization": f"Bearer {salary_token}"}
+
+            requests_url = "http://localhost:8001/salary-requests/cleanup"
+            try:
+                response = requests.delete(
+                    requests_url,
+                    params={"employeecode": employee_code},
+                    headers=headers,
+                    timeout=10
+                )
+                print(f"[DEBUG] Cleanup requests response: {response.status_code}")
+            except Exception as e:
+                print(f"[ERROR] Cleanup requests failed: {str(e)}")
+
+            salary_url = f"http://localhost:8001/salaries/{employee_code}"
+            try:
+                response2 = requests.delete(salary_url, headers=headers, timeout=10)
+                print(f"[DEBUG] Delete salary response: {response2.status_code}")
+            except Exception as e:
+                print(f"[ERROR] Delete salary failed: {str(e)}")
+
+            print(f"[INFO] Cleaned up salary data for employee {employee_code}")
+            return True
+
+        except Exception as e:
+            print(f"[ERROR] Error cleaning up salary data: {str(e)}")
+            return False
+
+    def get_salary_token(self):
+        try:
+            response = requests.post(
+                "http://localhost:8001/login",
+                json={
+                    "username": os.getenv("SALARY_ADMIN_USER", "admin"),
+                    "password": os.getenv("SALARY_ADMIN_PASS", "admin123")
+                },
+                timeout=10
+            )
+            if response.status_code == 200:
+                return response.json()["access_token"]
+            print(f"[ERROR] Salary token fetch failed: {response.status_code}")
+            return None
+        except Exception as e:
+            print(f"[ERROR] Salary token fetch error: {str(e)}")
+            return None

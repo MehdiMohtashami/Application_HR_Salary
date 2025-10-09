@@ -1,4 +1,4 @@
-from flask import Flask, render_template, request, redirect, url_for, session, flash
+from flask import Flask, render_template, request, redirect, url_for, session, flash, jsonify
 import requests
 from functools import wraps
 import os
@@ -20,6 +20,70 @@ def login_required(f):
         return f(*args, **kwargs)
     return decorated
 
+
+@app.route('/request_increase', methods=['GET', 'POST'])
+@login_required
+def request_increase():
+    if request.method == 'POST':
+        try:
+            employeecode = request.form['employeecode']
+            requestedsalary = float(request.form['requestedsalary'])
+            reason = request.form['reason']
+
+            # ارسال به سیستم حقوق
+            salary_response = requests.post(
+                'http://localhost:8001/salary-requests',
+                json={
+                    'employeecode': employeecode,
+                    'requestedsalary': requestedsalary,
+                    'reason': reason
+                },
+                headers={'Authorization': f'Bearer {session.get("hr_token")}'}
+            )
+
+            if salary_response.status_code == 200:
+                flash('درخواست افزایش حقوق با موفقیت ثبت شد', 'success')
+                return redirect(url_for('dashboard'))
+            else:
+                error = salary_response.json().get('detail', 'خطا در ارسال درخواست')
+                flash(f'خطا: {error}', 'danger')
+
+        except Exception as e:
+            flash(f'خطا در ثبت درخواست: {str(e)}', 'danger')
+
+    return render_template('request_increase.html',
+                           employee_code=request.args.get('employee_code', ''),
+                           requested_salary=request.args.get('requested_salary', ''))
+
+
+@app.route('/api/salary_info/<employee_code>')
+@login_required
+def api_salary_info(employee_code):
+    try:
+        # دریافت اطلاعات از سیستم حقوق
+        salary_response = requests.get(
+            f'http://localhost:8001/salaries/{employee_code}',
+            headers={'Authorization': f'Bearer {session.get("hr_token")}'}
+        )
+
+        if salary_response.status_code == 200:
+            salary_data = salary_response.json()
+
+            # دریافت اطلاعات کارمند از دیتابیس HR
+            from DataLayer_HR import HRDataLayer
+            hr_data = HRDataLayer()
+            employee = hr_data.get_employee_by_code(employee_code)
+
+            return jsonify({
+                'monthly_salary': salary_data.get('monthsalary', 0),
+                'yearly_salary': salary_data.get('yearlysalary', 0),
+                'employee_name': f"{employee[2]} {employee[3]}" if employee else 'نامشخص'
+            })
+        else:
+            return jsonify({'error': 'Salary not found'}), 404
+
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 @app.route('/')
 def index():
     return redirect(url_for('login'))
