@@ -1,404 +1,224 @@
-import requests
-from fastapi import FastAPI, HTTPException, Depends
-import logging
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, Query
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from typing import List, Optional
 import jwt
 import os
 import psycopg2
-from psycopg2 import sql
 from datetime import datetime, timedelta, UTC
 import bcrypt
 import requests
 from dotenv import load_dotenv
 from DataLayer_Sa import SalaryDataLayer
 from fastapi.middleware.cors import CORSMiddleware
-
+import logging
+from functools import lru_cache
 
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
-
 load_dotenv()
 
 app = FastAPI()
-security = HTTPBearer()
-data_layer = SalaryDataLayer()
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
+data_layer = SalaryDataLayer()
 SECRET_KEY = os.getenv("SECRET_KEY")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
+security = HTTPBearer()
 
-from fastapi.middleware.cors import CORSMiddleware
-
-app = FastAPI()
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 class SalaryBase(BaseModel):
     employeecode: str
     monthsalary: float
     yearlysalary: float
 
-
 class SalaryCreate(SalaryBase):
     pass
-
 
 class SalaryUpdate(BaseModel):
     monthsalary: Optional[float] = None
     yearlysalary: Optional[float] = None
-
 
 class SalaryRequest(BaseModel):
     employeecode: str
     requestedsalary: float
     reason: str
 
-
 class RequestUpdate(BaseModel):
     status: str
-
 
 class LoginRequest(BaseModel):
     username: str
     password: str
 
-
 class Token(BaseModel):
     access_token: str
     token_type: str
-
 
 def create_token(data: dict):
     to_encode = data.copy()
     expire = datetime.now(UTC) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     to_encode.update({"exp": expire})
-    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
-    return encoded_jwt
-
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
 def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
     try:
         payload = jwt.decode(credentials.credentials, SECRET_KEY, algorithms=[ALGORITHM])
-        username: str = payload.get("sub")
+        username = payload.get("sub")
         if username is None:
-            raise HTTPException(status_code=401, detail="Invalid token")
+            raise HTTPException(401, "Invalid token")
         return username
     except jwt.ExpiredSignatureError:
-        raise HTTPException(status_code=401, detail="Token expired")
+        raise HTTPException(401, "Token expired")
     except jwt.JWTError:
-        raise HTTPException(status_code=401, detail="Invalid token")
-
+        raise HTTPException(401, "Invalid token")
 
 @app.post("/login", response_model=Token)
 async def login(request: LoginRequest):
-    print(f"[DEBUG] Login attempt for username: {request.username}")
-
-    try:
-        conn = psycopg2.connect(
-            dbname=os.getenv('SALARY_DB_NAME'),
-            user=os.getenv('SALARY_DB_USER'),
-            password=os.getenv('SALARY_DB_PASSWORD'),
-            host=os.getenv('SALARY_DB_HOST'),
-            port=os.getenv('SALARY_DB_PORT')
-        )
-        cursor = conn.cursor()
-        print("[DEBUG] Connected to database successfully")
-
-        # بررسی کاربر
-        cursor.execute("SELECT username, password FROM users WHERE username = %s", (request.username,))
-        user = cursor.fetchone()
-
-        if user:
-            print(f"[DEBUG] User found in database: {user[0]}")
-            print(f"[DEBUG] Stored password hash: {user[1][:20]}...")
-
-            if bcrypt.checkpw(request.password.encode('utf-8'), user[1].encode('utf-8')):
-                print("[DEBUG] Password verification successful")
-                access_token = create_token(data={"sub": user[0]})
-                return {"access_token": access_token, "token_type": "bearer"}
-            else:
-                print("[DEBUG] Password verification failed")
-        else:
-            print(f"[DEBUG] User not found in database: {request.username}")
-
-        raise HTTPException(status_code=401, detail="Invalid credentials")
-
-    except Exception as e:
-        print(f"[DEBUG] Error during login: {e}")
-        raise HTTPException(status_code=401, detail="Invalid credentials")
-    finally:
-        if 'cursor' in locals():
-            cursor.close()
-        if 'conn' in locals():
-            conn.close()
-
+    with data_layer.get_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT username, password FROM users WHERE username = %s", (request.username,))
+            user = cursor.fetchone()
+            if user and bcrypt.checkpw(request.password.encode('utf-8'), user[1].encode('utf-8')):
+                return {"access_token": create_token({"sub": user[0]}), "token_type": "bearer"}
+    raise HTTPException(401, "Invalid credentials")
 
 @app.post("/salaries", response_model=dict)
-async def create_salary(
-        salary: SalaryCreate,
-        username: str = Depends(verify_token)
-):
+async def create_salary(salary: SalaryCreate, username: str = Depends(verify_token)):
     try:
-        salary_id = data_layer.create_salary_record(
-            salary.employeecode,
-            salary.monthsalary,
-            salary.yearlysalary
-        )
-        return {"id": salary_id, "message": "Salary record created successfully"}
+        salary_id = data_layer.create_salary_record(salary.employeecode, salary.monthsalary, salary.yearlysalary)
+        return {"id": salary_id, "message": "Created"}
     except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
+        logger.error(f"Create salary failed: {str(e)}")
+        raise HTTPException(400, str(e))
+    except Exception as e:
+        logger.error(f"Unexpected error in create_salary: {str(e)}")
+        raise HTTPException(500, "Internal server error")
 
 @app.get("/salaries/{employee_code}")
-async def get_salary(
-        employee_code: str,
-        username: str = Depends(verify_token)
-):
-    try:
-        logger.debug(f"Getting salary info for {employee_code}")
-
-        # اتصال به دیتابیس
-        conn = psycopg2.connect(
-            dbname=os.getenv('SALARY_DB_NAME'),
-            user=os.getenv('SALARY_DB_USER'),
-            password=os.getenv('SALARY_DB_PASSWORD'),
-            host=os.getenv('SALARY_DB_HOST'),
-            port=os.getenv('SALARY_DB_PORT')
-        )
-        cursor = conn.cursor()
-
-        # دریافت اطلاعات حقوق
-        cursor.execute("SELECT * FROM salary WHERE employeecode = %s", (employee_code,))
-        salary_info = cursor.fetchone()
-
-        if salary_info:
-            logger.debug(f"Found salary info for {employee_code}")
-            return {
-                "EmployeeCode": salary_info[1],
-                "MonthSalary": float(salary_info[2]),
-                "YearlySalary": float(salary_info[3])
-            }
-        else:
-            logger.warning(f"Salary info not found for {employee_code}")
-            raise HTTPException(status_code=404, detail="Salary record not found")
-
-    except Exception as e:
-        logger.error(f"Error getting salary info: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        if 'cursor' in locals():
-            cursor.close()
-        if 'conn' in locals():
-            conn.close()
-
+async def get_salary(employee_code: str, username: str = Depends(verify_token)):
+    salary_info = data_layer.get_salary_info(employee_code)
+    if salary_info:
+        return {
+            "employeecode": salary_info[1],
+            "monthsalary": float(salary_info[2]),
+            "yearlysalary": float(salary_info[3])
+        }
+    raise HTTPException(404, "Not found")
 
 @app.put("/salaries/{employee_code}", response_model=dict)
-async def update_salary(
-        employee_code: str,
-        update_data: SalaryUpdate,
-        username: str = Depends(verify_token)
-):
+async def update_salary(employee_code: str, update_data: SalaryUpdate, username: str = Depends(verify_token)):
     try:
-        data_layer.update_salary(
-            employee_code,
-            update_data.monthsalary,
-            update_data.yearlysalary
-        )
-        return {"message": "Salary updated successfully"}
+        data_layer.update_salary(employee_code, update_data.monthsalary, update_data.yearlysalary)
+        return {"message": "Updated"}
     except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
+        raise HTTPException(400, str(e))
 
 @app.post("/salary-requests", response_model=dict)
-async def create_salary_request(
-        request_data: SalaryRequest,
-        username: str = Depends(verify_token)
-):
+async def create_salary_request(request_data: SalaryRequest, username: str = Depends(verify_token)):
     try:
-        request_id = data_layer.create_salary_request(
-            request_data.employeecode,
-            request_data.requestedsalary,
-            request_data.reason
-        )
-        return {"id": request_id, "message": "Salary request created successfully"}
+        request_id = data_layer.create_salary_request(request_data.employeecode, request_data.requestedsalary, request_data.reason)
+        return {"id": request_id, "message": "Created"}
     except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(400, str(e))
 
 
 @app.get("/salary-requests")
-async def get_salary_requests(username: str = Depends(verify_token)):
-    requests = data_layer.get_all_requests()
-    results = []
+async def get_salary_requests(username: str = Depends(verify_token), page: int = Query(1, ge=1),
+                              limit: int = Query(10, ge=1)):
+    try:
+        requests = data_layer.get_all_requests(page, limit)
+        if not requests:
+            return []
 
-    for req in requests:
-        # req[1] = employeecode
-        employeecode = req[1]
+        employee_codes = [req[1] for req in requests]
 
-        try:
-            hr_response = requests.get(f"http://localhost:8000/api/employees/{employeecode}")
-            if hr_response.status_code == 200:
-                hr_data = hr_response.json()
-                employeename = f"{hr_data['firstname']} {hr_data['lastname']}"
-            else:
-                employeename = "Unknown"
-        except:
-            employeename = "Unknown"
+        hr_token = data_layer.get_hr_token()
+        if not hr_token:
+            logger.error("Failed to get HR token for batch request")
+            return [{
+                "id": req[0], "employeecode": req[1], "employeename": "Unknown",
+                "currentsalary": float(req[2]) if req[2] else 0.0,
+                "requestedsalary": float(req[3]) if req[3] else 0.0,
+                "reason": req[4] or "", "status": req[5] or "Pending",
+                "requestdate": req[6].strftime("%Y-%m-%d") if req[6] else None
+            } for req in requests]
 
-        results.append({
-            "ID": req[0],
-            "employeecode": employeecode,
-            "employeename": employeename,
-            "currentsalary": float(req[2]) if req[2] else 0.0,
-            "requestedsalary": float(req[3]) if req[3] else 0.0,
-            "reason": req[4] if req[4] else "",
-            "status": req[5] if req[5] else "Pending",
-            "requestdate": req[6].strftime("%Y-%m-%d") if req[6] else None
-        })
+        import requests as http_requests
+        hr_response = http_requests.post(
+            "http://localhost:8000/employees/batch",
+            json=employee_codes,
+            headers={"Authorization": f"Bearer {hr_token}"},
+            timeout=10
+        )
 
-    return results
+        hr_employees = {}
+        if hr_response.status_code == 200:
+            for emp in hr_response.json():
+                hr_employees[emp['employeecode']] = emp
 
-
+        results = []
+        for req in requests:
+            emp = hr_employees.get(req[1])
+            employeename = f"{emp['firstname']} {emp['lastname']}" if emp else "Unknown"
+            results.append({
+                "id": req[0], "employeecode": req[1], "employeename": employeename,
+                "currentsalary": float(req[2]) if req[2] else 0.0,
+                "requestedsalary": float(req[3]) if req[3] else 0.0,
+                "reason": req[4] or "", "status": req[5] or "Pending",
+                "requestdate": req[6].strftime("%Y-%m-%d") if req[6] else None
+            })
+        return results
+    except Exception as e:
+        logger.error(f"Error in get_salary_requests: {str(e)}")
+        raise HTTPException(500, "Internal server error")
 
 @app.put("/salary-requests/{request_id}", response_model=dict)
-async def update_request_status(
-        request_id: int,
-        update_data: RequestUpdate,
-        username: str = Depends(verify_token)
-):
+async def update_request_status(request_id: int, update_data: RequestUpdate, username: str = Depends(verify_token)):
     try:
         data_layer.update_request_status(request_id, update_data.status)
-        return {"message": "Request status updated successfully"}
+        return {"message": "Updated"}
     except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
+        raise HTTPException(400, str(e))
 
 @app.get("/employees-with-salary")
 async def get_employees_with_salary(username: str = Depends(verify_token)):
-    try:
-        logger.debug("Starting get_employees_with_salary")
-
-        conn = psycopg2.connect(
-            dbname=os.getenv('SALARY_DB_NAME'),
-            user=os.getenv('SALARY_DB_USER'),
-            password=os.getenv('SALARY_DB_PASSWORD'),
-            host=os.getenv('SALARY_DB_HOST'),
-            port=os.getenv('SALARY_DB_PORT')
-        )
-        cursor = conn.cursor()
-        logger.debug("Connected to salary database")
-
-        cursor.execute("""
-            SELECT s.id, s.employeecode, s.monthsalary, s.yearlysalary, 
-                   sr.status as request_status, sr.requestedsalary
-            FROM salary s
-            LEFT JOIN (
-                SELECT employeecode, status, requestedsalary,
-                       ROW_NUMBER() OVER (PARTITION BY employeecode ORDER BY requestdate DESC) as rn
-                FROM salary_requests
-            ) sr ON s.employeecode = sr.employeecode AND sr.rn = 1
-        """)
-        salary_records = cursor.fetchall()
-        logger.debug(f"Found {len(salary_records)} salary records")
-
-        result = []
-
-        for record in salary_records:
-            employee_code = record[1]
-            month_salary = record[2]
-            yearly_salary = record[3]
-            request_status = record[4]
-            requested_salary = record[5]
-
-            logger.debug(f"Processing employee {employee_code}")
-
-            employee_info = get_employee_from_hr(employee_code)
-
-            if employee_info:
-                logger.debug(f"Found employee info for {employee_code}")
-                result.append({
-                    "id": record[0],
-                    "employeecode": employee_code,
-                    "firstname": employee_info.get("firstname", ""),
-                    "lastname": employee_info.get("lastname", ""),
-                    "jobtitle": employee_info.get("jobtitle", ""),
-                    "departmentname": employee_info.get("departmentname", ""),
-                    "monthsalary": float(month_salary) if month_salary else 0,
-                    "yearlysalary": float(yearly_salary) if yearly_salary else 0,
-                    "requeststatus": request_status,
-                    "requestedsalary": float(requested_salary) if requested_salary else None
-                })
-            else:
-                logger.warning(f"Employee info not found for {employee_code}")
-                result.append({
-                    "id": record[0],
-                    "employeecode": employee_code,
-                    "firstname": "نام",
-                    "lastname": "نام خانوادگی",
-                    "jobtitle": "سمت",
-                    "departmentname": "دپارتمان",
-                    "monthsalary": float(month_salary) if month_salary else 0,
-                    "yearlysalary": float(yearly_salary) if yearly_salary else 0,
-                    "requeststatus": request_status,
-                    "requestedsalary": float(requested_salary) if requested_salary else None
-                })
-
-        logger.debug(f"Returning {len(result)} employee records")
-        return result
-    except Exception as e:
-        logger.error(f"Error in get_employees_with_salary: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        if 'cursor' in locals():
-            cursor.close()
-        if 'conn' in locals():
-            conn.close()
-
-
-def get_employee_from_hr(employee_code: str):
-    try:
-        logger.debug(f"Fetching employee info from HR for {employee_code}")
-
-        token_response = requests.post(
-            "http://localhost:8000/login",
-            json={"username": "admin", "password": "admin123"}
-        )
-
-        if token_response.status_code != 200:
-            logger.error(f"Failed to get token from HR API: {token_response.status_code}")
-            return None
-
-        token = token_response.json().get("access_token")
-        headers = {"Authorization": f"Bearer {token}"}
-        logger.debug("Got token from HR API")
-
-        employee_response = requests.get(
-            f"http://localhost:8000/employees/{employee_code}",
-            headers=headers
-        )
-
-        if employee_response.status_code == 200:
-            employee_data = employee_response.json()
-            logger.debug(f"Found employee info for {employee_code}: {employee_data}")
-            return employee_data
-        else:
-            logger.error(f"Failed to get employee info: {employee_response.status_code}")
-            return None
-    except Exception as e:
-        logger.error(f"Error in get_employee_from_hr: {str(e)}")
-        return None
-
-
-
+    with data_layer.get_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute("""
+                SELECT s.id, s.employeecode, s.monthsalary, s.yearlysalary,
+                       sr.status as request_status, sr.requestedsalary
+                FROM salary s
+                LEFT JOIN (
+                    SELECT employeecode, status, requestedsalary,
+                           ROW_NUMBER() OVER (PARTITION BY employeecode ORDER BY requestdate DESC) as rn
+                    FROM salary_requests
+                ) sr ON s.employeecode = sr.employeecode AND sr.rn = 1
+            """)
+            records = cursor.fetchall()
+    hr_token = data_layer.get_hr_token()
+    codes = [rec[1] for rec in records]
+    hr_response = requests.post("http://localhost:8000/employees/batch", json=codes, headers={"Authorization": f"Bearer {hr_token}"})
+    if hr_response.status_code != 200:
+        raise HTTPException(500, "HR batch failed")
+    hr_data = {emp['employeecode']: emp for emp in hr_response.json()}
+    result = []
+    for rec in records:
+        code = rec[1]
+        emp = hr_data.get(code, {})
+        result.append({
+            "id": rec[0], "employeecode": code,
+            "firstname": emp.get("firstname", "نام"),
+            "lastname": emp.get("lastname", "نام خانوادگی"),
+            "jobtitle": emp.get("jobtitle", "سمت"),
+            "departmentname": emp.get("departmentname", "دپارتمان"),
+            "monthsalary": float(rec[2]) if rec[2] else 0,
+            "yearlysalary": float(rec[3]) if rec[3] else 0,
+            "requeststatus": rec[4],
+            "requestedsalary": float(rec[5]) if rec[5] else None
+        })
+    return result
 
 if __name__ == "__main__":
     import uvicorn
-
     uvicorn.run(app, host="0.0.0.0", port=8001)

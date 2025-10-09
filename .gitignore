@@ -15,3 +15,4 @@ test_hr_api.py
 /Salary/create_salary_requests.py
 /Salary/create_salary_tables.py
 /Salary/create_satary_login.py
+/Salary/test_salary_login.py
